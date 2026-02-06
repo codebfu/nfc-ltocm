@@ -38,6 +38,9 @@ static int szRxBytes;
 /// NFC device handle
 static nfc_device *pnd;
 
+/// When true, ignore write-inhibit and allow writing any block (--bypass-write-protection).
+static bool bypass_write_protection = false;
+
 
 /***
  * LTO-CM commands
@@ -219,9 +222,143 @@ bool ltocm_readblkcnt(uint8_t *retReadBlk, int *retLenReadBlk)
 
 }
 
+/**
+ * Read block 1 (Write-Inhibit page at address 32), parse Last Write-Inhibited
+ * Block Number and Block 1 Protection Flag; return true iff block is writable.
+ * ECMA-319 Annex D.2.2.
+ * If bypass_write_protection is set (--bypass-write-protection), always returns true.
+ */
+bool ltocm_is_block_writable(size_t block)
+{
+	if (bypass_write_protection)
+		return true;
+
+	uint8_t retReadBlk[18];
+	int retLenReadBlk;
+	uint8_t last_inhibited;
+	uint8_t block1_protect;
+
+	if (!ltocm_readblk(1, retReadBlk, &retLenReadBlk))
+		return false;
+	if (retLenReadBlk == 1 && retReadBlk[0] == LTOCM_NACK)
+		return false;
+	if (retLenReadBlk < 2)
+		return false;
+
+	last_inhibited = retReadBlk[0];
+	block1_protect = retReadBlk[1];
+
+	/* Consume second half of block 1 to keep LTO-CM state consistent */
+	if (!ltocm_readblkcnt(retReadBlk, &retLenReadBlk))
+		return false;
+
+	if (block <= last_inhibited)
+		return false;
+	if (block == 1 && block1_protect == 0x01)
+		return false;
+	return true;
+}
+
+bool ltocm_write_word(size_t block, unsigned int word_index, const uint8_t data[2])
+{
+	uint8_t cmd[4];
+	uint8_t dataPkt[4];
+
+	if (word_index > 15)
+		return false;
+	if (!ltocm_is_block_writable(block))
+		return false;
+
+	cmd[0] = (uint8_t)(0xB0 | (word_index & 0x0F));
+	cmd[1] = (uint8_t)(block & 0xff);
+	iso14443a_crc_append(cmd, 2);
+
+	if (!transmit_bytes(cmd, sizeof(cmd)))
+		return false;
+	if (szRxBytes != 1 || abtRx[0] != LTOCM_ACK)
+		return false;
+
+	dataPkt[0] = data[0];
+	dataPkt[1] = data[1];
+	iso14443a_crc_append(dataPkt, 2);
+
+	if (!transmit_bytes(dataPkt, sizeof(dataPkt)))
+		return false;
+	if (szRxBytes != 1 || abtRx[0] != LTOCM_ACK)
+		return false;
+
+	return true;
+}
+
+bool ltocm_write_block(size_t block, const uint8_t data[32])
+{
+	uint8_t cmd[4];
+	uint8_t part1[18];
+	uint8_t part2[18];
+
+	if (!ltocm_is_block_writable(block))
+		return false;
+
+	cmd[0] = 0xA0;
+	cmd[1] = (uint8_t)(block & 0xff);
+	iso14443a_crc_append(cmd, 2);
+
+	if (!transmit_bytes(cmd, sizeof(cmd)))
+		return false;
+	if (szRxBytes != 1 || abtRx[0] != LTOCM_ACK)
+		return false;
+
+	memcpy(part1, data, 16);
+	iso14443a_crc_append(part1, 16);
+	if (!transmit_bytes(part1, sizeof(part1)))
+		return false;
+	if (szRxBytes != 1 || abtRx[0] != LTOCM_ACK)
+		return false;
+
+	memcpy(part2, &data[16], 16);
+	iso14443a_crc_append(part2, 16);
+	if (!transmit_bytes(part2, sizeof(part2)))
+		return false;
+	if (szRxBytes != 1 || abtRx[0] != LTOCM_ACK)
+		return false;
+
+	return true;
+}
+
 int main(int argc, char **argv)
 {
 	int returncode = EXIT_SUCCESS;
+	int write_mode = 0;       /* 0 = read, 1 = --write, 2 = --write-block */
+	char *write_filename = NULL;
+	size_t write_block_index = 0;
+	int arg_write = -1;       /* index of --write */
+	int arg_write_block = -1; /* index of --write-block */
+
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--bypass-write-protection") == 0)
+			bypass_write_protection = true;
+		else if (strcmp(argv[i], "--write") == 0)
+			arg_write = i;
+		else if (strcmp(argv[i], "--write-block") == 0)
+			arg_write_block = i;
+	}
+
+	if (arg_write >= 0 && arg_write_block < 0) {
+		if (arg_write + 1 >= argc) {
+			printf("Usage: %s [--bypass-write-protection] --write <file.bin>\n", argv[0]);
+			exit(EXIT_FAILURE);
+		}
+		write_mode = 1;
+		write_filename = argv[arg_write + 1];
+	} else if (arg_write_block >= 0 && arg_write < 0) {
+		if (arg_write_block + 2 >= argc) {
+			printf("Usage: %s [--bypass-write-protection] --write-block <block> <file.bin>\n", argv[0]);
+			exit(EXIT_FAILURE);
+		}
+		write_mode = 2;
+		write_block_index = (size_t)atoi(argv[arg_write_block + 1]);
+		write_filename = argv[arg_write_block + 2];
+	}
 
 	// Initialise libnfc
 	nfc_context *context;
@@ -361,103 +498,160 @@ int main(int argc, char **argv)
 		goto err_exit;
 	}
 
-	// Chip is now in the LTO-CM COMMAND state, we should be able to read it
+	// Chip is now in the LTO-CM COMMAND state
 
-	// Read all blocks in the chip
-	printf("Reading LTO-CM data to file\n");
+	if (write_mode == 1 || write_mode == 2) {
+		/* Write mode */
+		FILE *fp = fopen(write_filename, "rb");
+		if (!fp) {
+			printf("Error: cannot open input file '%s'\n", write_filename);
+			returncode = EXIT_FAILURE;
+			goto err_exit;
+		}
 
-	char *p_filename;
-	if (argc == 1) {
-		p_filename = &default_filename[0];
-	} else {
-		p_filename = argv[1];
-	}
+		uint8_t blockBuf[32];
 
-	FILE *fp = fopen(p_filename, "wb");
-	if (!fp) {
-		printf("Error: cannot open output file '%s'\n", argv[1]);
-		returncode = EXIT_FAILURE;
-		goto err_exit;
-	}
-
-	uint8_t blockBuf[32];
-	uint8_t crcBlock[2];
-	uint8_t retReadBlk[18];
-	int retLenReadBlk;
-
-	for (size_t block = 0; block < numLTOCMBlocks; block++) {
-
-		// read the first half of the block
-		if (numLTOCMBlocks <= 255) {
-			if (!ltocm_readblk(block, &retReadBlk[0], &retLenReadBlk)) {
-				printf("Error: error with READ BLOCK command, block=%zu of %zu\n", block, numLTOCMBlocks-1);
-				returncode = EXIT_FAILURE;
-				goto err_exit;
+		if (write_mode == 1) {
+			printf("Writing LTO-CM data from file '%s'\n", write_filename);
+			for (size_t block = 0; block < numLTOCMBlocks; block++) {
+				size_t n = fread(blockBuf, 1, sizeof(blockBuf), fp);
+				if (n == 0)
+					break;
+				if (n != sizeof(blockBuf)) {
+					printf("Error: file truncated at block %zu (got %zu bytes)\n", block, n);
+					returncode = EXIT_FAILURE;
+					fclose(fp);
+					goto err_exit;
+				}
+				if (!ltocm_is_block_writable(block)) {
+					printf("Error: block %zu is write-inhibited\n", block);
+					returncode = EXIT_FAILURE;
+					fclose(fp);
+					goto err_exit;
+				}
+				if (!ltocm_write_block(block, blockBuf)) {
+					printf("Error: WRITE BLOCK %zu failed\n", block);
+					returncode = EXIT_FAILURE;
+					fclose(fp);
+					goto err_exit;
+				}
 			}
+			printf("Write complete.\n");
 		} else {
-			if (!ltocm_readblk_ext(block, &retReadBlk[0], &retLenReadBlk)) {
-				printf("Error: error with READ BLOCK command, block=%zu of %zu\n", block, numLTOCMBlocks-1);
+			if (write_block_index >= numLTOCMBlocks) {
+				printf("Error: block index %zu out of range (0..%zu)\n", write_block_index, numLTOCMBlocks - 1);
+				returncode = EXIT_FAILURE;
+				fclose(fp);
+				goto err_exit;
+			}
+			if (fread(blockBuf, 1, sizeof(blockBuf), fp) != sizeof(blockBuf)) {
+				printf("Error: file '%s' has fewer than 32 bytes\n", write_filename);
+				returncode = EXIT_FAILURE;
+				fclose(fp);
+				goto err_exit;
+			}
+			if (!ltocm_is_block_writable(write_block_index)) {
+				printf("Error: block %zu is write-inhibited\n", write_block_index);
+				returncode = EXIT_FAILURE;
+				fclose(fp);
+				goto err_exit;
+			}
+			if (!ltocm_write_block(write_block_index, blockBuf)) {
+				printf("Error: WRITE BLOCK %zu failed\n", write_block_index);
+				returncode = EXIT_FAILURE;
+				fclose(fp);
+				goto err_exit;
+			}
+			printf("Block %zu written.\n", write_block_index);
+		}
+		fclose(fp);
+	} else {
+		/* Read mode (default) */
+		printf("Reading LTO-CM data to file\n");
+
+		char *p_filename = &default_filename[0];
+		for (int i = 1; i < argc; i++) {
+			if (argv[i][0] != '-') {
+				p_filename = argv[i];
+				break;
+			}
+		}
+
+		FILE *fp = fopen(p_filename, "wb");
+		if (!fp) {
+			printf("Error: cannot open output file '%s'\n", p_filename);
+			returncode = EXIT_FAILURE;
+			goto err_exit;
+		}
+
+		uint8_t blockBuf[32];
+		uint8_t crcBlock[2];
+		uint8_t retReadBlk[18];
+		int retLenReadBlk;
+
+		for (size_t block = 0; block < numLTOCMBlocks; block++) {
+
+			if (numLTOCMBlocks <= 255) {
+				if (!ltocm_readblk(block, &retReadBlk[0], &retLenReadBlk)) {
+					printf("Error: error with READ BLOCK command, block=%zu of %zu\n", block, numLTOCMBlocks-1);
+					returncode = EXIT_FAILURE;
+					goto err_exit;
+				}
+			} else {
+				if (!ltocm_readblk_ext(block, &retReadBlk[0], &retLenReadBlk)) {
+					printf("Error: error with READ BLOCK command, block=%zu of %zu\n", block, numLTOCMBlocks-1);
+					returncode = EXIT_FAILURE;
+					goto err_exit;
+				}
+			}
+			if ((retLenReadBlk == 1) && (retReadBlk[0] == LTOCM_NACK)) {
+				printf("Error: READ BLOCK %zu (of %zu) failed, NACK\n", block, numLTOCMBlocks-1);
+				returncode = EXIT_FAILURE;
+				goto err_exit;
+			} else if (retLenReadBlk != 18) {
+				printf("Error: READ BLOCK %zu (of %zu) failed, insufficient response bytes\n", block, numLTOCMBlocks-1);
 				returncode = EXIT_FAILURE;
 				goto err_exit;
 			}
-		}
-		// check the byte count and response bytes
-		if ((retLenReadBlk == 1) && (retReadBlk[0] == LTOCM_NACK)) {
-			printf("Error: READ BLOCK %zu (of %zu) failed, NACK\n", block, numLTOCMBlocks-1);
-			returncode = EXIT_FAILURE;
-			goto err_exit;
-		} else if (retLenReadBlk != 18) {
-			printf("Error: READ BLOCK %zu (of %zu) failed, insufficient response bytes\n", block, numLTOCMBlocks-1);
-			returncode = EXIT_FAILURE;
-			goto err_exit;
-		}
 
-		// check the CRC
-		iso14443a_crc(retReadBlk, 16, crcBlock);
-		if (memcmp(&retReadBlk[16], crcBlock, 2) != 0) {
-			printf("Error: READ BLOCK %zu (of %zu) failed, CRC error\n", block, numLTOCMBlocks-1);
-			returncode = EXIT_FAILURE;
-			goto err_exit;
-		}
+			iso14443a_crc(retReadBlk, 16, crcBlock);
+			if (memcmp(&retReadBlk[16], crcBlock, 2) != 0) {
+				printf("Error: READ BLOCK %zu (of %zu) failed, CRC error\n", block, numLTOCMBlocks-1);
+				returncode = EXIT_FAILURE;
+				goto err_exit;
+			}
 
-		// copy first half of the block into the buffer
-		memcpy(blockBuf, retReadBlk, 16);
+			memcpy(blockBuf, retReadBlk, 16);
 
+			if (!ltocm_readblkcnt(&retReadBlk[0], &retLenReadBlk)) {
+				printf("Error: error with READ BLOCK CONTINUE command, block=%zu\n", block);
+				returncode = EXIT_FAILURE;
+				goto err_exit;
+			}
 
-		// read the second half of the block
-		if (!ltocm_readblkcnt(&retReadBlk[0], &retLenReadBlk)) {
-			printf("Error: error with READ BLOCK CONTINUE command, block=%zu\n", block);
-			returncode = EXIT_FAILURE;
-			goto err_exit;
-		}
+			if ((retLenReadBlk == 1) && (retReadBlk[0] == LTOCM_NACK)) {
+				printf("Error: READ BLOCK %zu (of %zu) failed, NACK\n", block, numLTOCMBlocks-1);
+				returncode = EXIT_FAILURE;
+				goto err_exit;
+			} else if (retLenReadBlk != 18) {
+				printf("Error: READ BLOCK %zu (of %zu) failed, insufficient response bytes\n", block, numLTOCMBlocks-1);
+				returncode = EXIT_FAILURE;
+				goto err_exit;
+			}
 
-		// check the byte count and response bytes
-		if ((retLenReadBlk == 1) && (retReadBlk[0] == LTOCM_NACK)) {
-			printf("Error: READ BLOCK %zu (of %zu) failed, NACK\n", block, numLTOCMBlocks-1);
-			returncode = EXIT_FAILURE;
-			goto err_exit;
-		} else if (retLenReadBlk != 18) {
-			printf("Error: READ BLOCK %zu (of %zu) failed, insufficient response bytes\n", block, numLTOCMBlocks-1);
-			returncode = EXIT_FAILURE;
-			goto err_exit;
+			iso14443a_crc(retReadBlk, 16, crcBlock);
+			if (memcmp(&retReadBlk[16], crcBlock, 2) != 0) {
+				printf("Error: READ BLOCK %zu (of %zu) failed, CRC error\n", block, numLTOCMBlocks-1);
+				returncode = EXIT_FAILURE;
+				goto err_exit;
+			}
+
+			memcpy(&blockBuf[16], retReadBlk, 16);
+			fwrite(blockBuf, 1, sizeof(blockBuf), fp);
 		}
 
-		// check the CRC
-		iso14443a_crc(retReadBlk, 16, crcBlock);
-		if (memcmp(&retReadBlk[16], crcBlock, 2) != 0) {
-			printf("Error: READ BLOCK %zu (of %zu) failed, CRC error\n", block, numLTOCMBlocks-1);
-			returncode = EXIT_FAILURE;
-			goto err_exit;
-		}
-
-		// copy second half of the block into the buffer
-		memcpy(&blockBuf[16], retReadBlk, 16);
-
-		// save the whole block to the file
-		fwrite(blockBuf, 1, sizeof(blockBuf), fp);
+		fclose(fp);
 	}
-
-	fclose(fp);
 
 
 err_exit:
